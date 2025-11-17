@@ -1,0 +1,20 @@
+CMakeFiles/xnet.dir/src/app.c.obj: \
+ E:\team_assignment\course\CS_net\experiment1\start\xnet_tiny\src\app.c \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/stdio.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/crtdefs.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/_mingw.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/_mingw_mac.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/_mingw_secapi.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/vadefs.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/sdks/_mingw_directx.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/sdks/_mingw_ddk.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/_mingw_print_push.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/_mingw_off_t.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/swprintf.inl \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/sec_api/stdio_s.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/_mingw_print_pop.h \
+ E:/team_assignment/course/CS_net/experiment1/start/xnet_tiny/src/xnet_tiny/xnet_tiny.h \
+ E:/team_assignment/course/CS_net/mingw64/lib/gcc/x86_64-w64-mingw32/8.1.0/include/stdint.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/stdint.h \
+ E:/team_assignment/course/CS_net/mingw64/lib/gcc/x86_64-w64-mingw32/8.1.0/include/stddef.h \
+ E:/team_assignment/course/CS_net/mingw64/x86_64-w64-mingw32/include/stddef.h

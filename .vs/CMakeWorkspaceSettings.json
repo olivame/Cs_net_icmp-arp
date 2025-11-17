@@ -1,0 +1,4 @@
+{
+  "enableCMake": true,
+  "sourceDirectory": "xnet_tiny"
+}

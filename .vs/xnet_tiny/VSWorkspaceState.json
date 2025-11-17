@@ -1,0 +1,8 @@
+{
+  "OutputFoldersPerTargetSystem": {
+    "Local Machine": [
+      "xnet_tiny\\out\\build\\x64-Debug",
+      "xnet_tiny\\out\\install\\x64-Debug"
+    ]
+  }
+}
