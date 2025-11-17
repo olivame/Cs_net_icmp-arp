@@ -26,6 +26,22 @@ typedef struct _xarp_packet_t {
     uint8_t  target_ip[4];                         // 目标 IP
 } xarp_packet_t;
 
+#define XARP_TABLE_SIZE 8
+
+typedef enum _xarp_entry_state_t {
+    XARP_ENTRY_FREE = 0,
+    XARP_ENTRY_PENDING,
+    XARP_ENTRY_OK,
+} xarp_entry_state_t;
+
+typedef struct _xarp_entry_t {
+    uint8_t ip[4];
+    uint8_t mac[XNET_MAC_ADDR_SIZE];
+    xarp_entry_state_t state;
+    uint8_t retry;      // 已重发次数
+    uint16_t ttl;       // 剩余“生存时间”（轮询计数）
+} xarp_entry_t;
+
 typedef enum _xarp_opcode_t {
     XARP_OPCODE_REQUEST = 1,                       // ARP 请求
     XARP_OPCODE_REPLY   = 2,                       // ARP 应答
@@ -67,6 +83,9 @@ typedef enum _xnet_protocol_t {
     XNET_PROTOCOL_ARP = 0x0806,                    // ARP 协议
     XNET_PROTOCOL_IP  = 0x0800,                    // IP 协议
 } xnet_protocol_t;
+
+const uint8_t * arp_resolve(const uint8_t ip[4]);
+void arp_table_timer(void);
 
 void xnet_init (void);
 void xnet_poll(void);

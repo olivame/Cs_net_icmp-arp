@@ -1,15 +1,19 @@
 #include <string.h>
+#include <stdio.h> 
 #include "xnet_tiny.h"
 
 #define min(a, b)               ((a) > (b) ? (b) : (a))
 #define swap_order16(v)         ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
-
+static void arp_send_request(const uint8_t ip[4]);
 static uint8_t netif_mac[XNET_MAC_ADDR_SIZE];               // 本机 MAC 地址
 static uint8_t netif_ip[4];                                 // 本机 IP 地址（网络字节序）
 static xnet_packet_t tx_packet, rx_packet;                  // 收发缓冲区
 static const uint8_t broadcast_mac[XNET_MAC_ADDR_SIZE] = {  // 以太网广播 MAC
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 };
+
+static xarp_entry_t arp_table[XARP_TABLE_SIZE];
+static uint32_t arp_timer_ticks = 0;
 
 /**
  * 分配一个发送用的数据包
@@ -72,6 +76,29 @@ static void arp_init(void) {
     netif_ip[2] = 108;
     netif_ip[3] = 200;
 }
+
+static xarp_entry_t * arp_table_find(const uint8_t ip[4]) {
+    for (int i = 0; i < XARP_TABLE_SIZE; i++) {
+        if (arp_table[i].state != XARP_ENTRY_FREE &&
+            memcmp(arp_table[i].ip, ip, 4) == 0) {
+            return &arp_table[i];
+        }
+    }
+    return 0;
+}
+
+static xarp_entry_t * arp_table_alloc(const uint8_t ip[4]) {
+    for (int i = 0; i < XARP_TABLE_SIZE; i++) {
+        if (arp_table[i].state == XARP_ENTRY_FREE) {
+            xarp_entry_t *e = &arp_table[i];
+            memset(e, 0, sizeof(*e));
+            memcpy(e->ip, ip, 4);
+            return e;
+        }
+    }
+    return 0;
+}
+
 
 /**
  * 发送一个以太网帧
@@ -158,9 +185,99 @@ static void arp_in(xnet_packet_t *packet) {
 
         ethernet_out_to(XNET_PROTOCOL_ARP, reply_target_mac, packet);
     } else if (opcode == XARP_OPCODE_REPLY) {
-        // 拓展任务：这里可以更新 ARP 表（目前不做）
+        xarp_entry_t *e = arp_table_find(arp->sender_ip);
+        if (e == 0) {
+            e = arp_table_alloc(arp->sender_ip);
+        }
+        if (e) {
+            int index = (int)(e - arp_table);  // 新建 index 变量
+
+            memcpy(e->mac, arp->sender_mac, XNET_MAC_ADDR_SIZE);
+            e->state = XARP_ENTRY_OK;
+            e->ttl = 100;        // 例如 100 个“tick”后过期
+            e->retry = 0;
+
+            printf("ARP update[%d]: %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X\n",
+               index,
+               arp->sender_ip[0], arp->sender_ip[1], arp->sender_ip[2], arp->sender_ip[3],
+               arp->sender_mac[0], arp->sender_mac[1], arp->sender_mac[2],
+               arp->sender_mac[3], arp->sender_mac[4], arp->sender_mac[5]);
+        }
     }
 }
+
+const uint8_t * arp_resolve(const uint8_t ip[4]) {
+    xarp_entry_t *e = arp_table_find(ip);
+    if (e && e->state == XARP_ENTRY_OK) {
+        return e->mac;
+    }
+
+    if (e == 0) {
+        e = arp_table_alloc(ip);
+    }
+    if (e && e->state == XARP_ENTRY_FREE) {
+        // 填初始信息，发送第一次 ARP Request
+        e->state = XARP_ENTRY_PENDING;
+        e->retry = 3;       // 最多重发 3 次
+        e->ttl = 5;        // 等待 5 个 tick
+        // 构造并发送一次 ARP Request（和你现在回复用的结构类似）
+        // target_ip = ip, target_mac 全 0, dst MAC = 广播
+        // 可以写一个小函数 arp_send_request(ip) 复用上面的打包逻辑
+        arp_send_request(ip); 
+    }
+
+    return 0;   // 现在还不知道 MAC，上层需要等
+}
+
+
+void arp_table_timer(void) {
+    for (int i = 0; i < XARP_TABLE_SIZE; i++) {
+        xarp_entry_t *e = &arp_table[i];
+        if (e->state == XARP_ENTRY_FREE) continue;
+
+        if (e->ttl > 0) {
+            e->ttl--;
+        }
+
+        if (e->state == XARP_ENTRY_PENDING && e->ttl == 0) {
+            if (e->retry > 0) {
+                e->retry--;
+                e->ttl = 50;
+                printf("ARP retry[%d]: %d.%d.%d.%d, left=%d\n",
+                       i, e->ip[0], e->ip[1], e->ip[2], e->ip[3], e->retry);
+                arp_send_request(e->ip);
+            } else {
+                printf("ARP timeout free[%d]: %d.%d.%d.%d\n",
+                       i, e->ip[0], e->ip[1], e->ip[2], e->ip[3]);
+                e->state = XARP_ENTRY_FREE;
+            }
+        } else if (e->state == XARP_ENTRY_OK && e->ttl == 0) {
+            printf("ARP entry expired[%d]: %d.%d.%d.%d\n",
+                   i, e->ip[0], e->ip[1], e->ip[2], e->ip[3]);
+            e->state = XARP_ENTRY_FREE;
+        }
+    }
+}
+
+
+static void arp_send_request(const uint8_t ip[4]) {
+    xnet_packet_t *packet = xnet_alloc_for_send((uint16_t)sizeof(xarp_packet_t));
+    xarp_packet_t *arp = (xarp_packet_t *)packet->data;
+
+    arp->hw_type    = swap_order16(1);                 // 以太网
+    arp->proto_type = swap_order16(XNET_PROTOCOL_IP);  // IPv4
+    arp->hw_len     = XNET_MAC_ADDR_SIZE;
+    arp->proto_len  = 4;
+    arp->opcode     = swap_order16(XARP_OPCODE_REQUEST);
+
+    memcpy(arp->sender_mac, netif_mac, XNET_MAC_ADDR_SIZE);
+    memcpy(arp->sender_ip,  netif_ip,  4);             // 192.168.108.200
+    memset(arp->target_mac, 0,         XNET_MAC_ADDR_SIZE);
+    memcpy(arp->target_ip,  ip,        4);             // 要查询的 IP
+
+    ethernet_out_to(XNET_PROTOCOL_ARP, broadcast_mac, packet);
+}
+
 
 /**
  * 以太网帧输入处理
@@ -202,6 +319,12 @@ void xnet_init (void) {
 }
 
 void xnet_poll(void) {
+    static uint32_t tick = 0;
     ethernet_poll();
+
+    if (++tick >= 1) {     // 每调用 10 次 poll 当作 1 个 tick
+        tick = 0;
+        arp_table_timer();
+    }
 }
 
