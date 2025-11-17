@@ -126,8 +126,8 @@ src/xnet_tiny/clean: src/xnet_tiny/CMakeFiles/xnet_tiny.dir/clean
 # Target rules for target CMakeFiles/xnet.dir
 
 # All Build rule for target.
-CMakeFiles/xnet.dir/all: src/xnet_tiny/CMakeFiles/xnet_tiny.dir/all
 CMakeFiles/xnet.dir/all: src/xnet_app/CMakeFiles/xnet_app.dir/all
+CMakeFiles/xnet.dir/all: src/xnet_tiny/CMakeFiles/xnet_tiny.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\xnet.dir\build.make CMakeFiles/xnet.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\xnet.dir\build.make CMakeFiles/xnet.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=E:\team_assignment\course\CS_net\experiment1\start\build\CMakeFiles --progress-num=1,2,3 "Built target xnet"
