@@ -24,13 +24,18 @@ typedef struct _xip_hdr_t {
 } xip_hdr_t;
 
 typedef struct _xicmp_hdr_t {
-    uint8_t  type;       // 8=Request, 0=Reply
-    uint8_t  code;       // Echo 固定为 0
+    uint8_t  type;       // 8=Request, 0=Reply, 11=Time Exceeded, 3=Dest Unreachable
+    uint8_t  code;       // Echo 固定为 0; Time Exceeded: 0=TTL expired
     uint16_t checksum;
     uint16_t id;
     uint16_t seq;
     // 后面紧跟 data
 } xicmp_hdr_t;
+
+#define XICMP_TYPE_ECHO_REPLY       0
+#define XICMP_TYPE_DEST_UNREACH     3
+#define XICMP_TYPE_ECHO_REQUEST     8
+#define XICMP_TYPE_TIME_EXCEEDED    11
 
 typedef enum _xip_protocol_t {
     XIP_PROTOCOL_ICMP = 1,
@@ -124,9 +129,24 @@ void xip_out(xip_protocol_t protocol,
              const uint8_t dest_ip[4],
              xnet_packet_t *packet);
 
+void xip_out_ttl(xip_protocol_t protocol,
+                 const uint8_t dest_ip[4],
+                 xnet_packet_t *packet,
+                 uint8_t ttl);
+
 // Send a single ICMP Echo Request (ping)
 // Returns 0 on success (packet sent), -1 if destination MAC unknown (ARP in progress)
 int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq);
+
+// Traceroute: send ICMP Echo with specific TTL
+// Returns 0 on success, -1 if ARP unresolved
+int xicmp_traceroute_probe(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, uint8_t ttl);
+
+// Check if traceroute has reached destination
+int xicmp_traceroute_is_complete(void);
+
+// Get traceroute hop information
+void xicmp_traceroute_reset(void);
 
              
 #endif // XNET_TINY_H
