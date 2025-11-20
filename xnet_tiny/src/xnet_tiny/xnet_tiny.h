@@ -124,6 +124,10 @@ void xip_out(xip_protocol_t protocol,
              const uint8_t dest_ip[4],
              xnet_packet_t *packet);
 
+// Send a single ICMP Echo Request (ping)
+// Returns 0 on success (packet sent), -1 if destination MAC unknown (ARP in progress)
+int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq);
+
              
 #endif // XNET_TINY_H
 

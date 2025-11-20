@@ -16,6 +16,8 @@ static const uint8_t broadcast_mac[XNET_MAC_ADDR_SIZE] = {  // 以太网广播 M
 static xarp_entry_t arp_table[XARP_TABLE_SIZE];
 static uint32_t arp_timer_ticks = 0;
 
+// Ping id/seq generator could be kept externally; provide helper function below
+
 static uint16_t ip_checksum16(const void *buf, uint16_t len);
 static uint16_t icmp_checksum16(const void *buf, uint16_t len);
 
@@ -213,10 +215,14 @@ static void arp_in(xnet_packet_t *packet) {
 const uint8_t * arp_resolve(const uint8_t ip[4]) {
     xarp_entry_t *e = arp_table_find(ip);
     if (e && e->state == XARP_ENTRY_OK) {
+        printf("ARP hit: %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X\n",
+        ip[0], ip[1], ip[2], ip[3],
+        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
         return e->mac;
     }
 
     if (e == 0) {
+        
         e = arp_table_alloc(ip);
     }
     if (e && e->state == XARP_ENTRY_FREE) {
@@ -327,9 +333,10 @@ void xnet_poll(void) {
     static uint32_t tick = 0;
     ethernet_poll();
 
-    if (++tick >= 1) {     // 每调用 10 次 poll 当作 1 个 tick
+    if (++tick >= 10) {     // 每调用 10 次 poll 当作 1 个 tick
         tick = 0;
         arp_table_timer();
+        arp_timer_ticks++;   // increase global tick counter used for ping timestamps
     }
 }
 
@@ -379,9 +386,62 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
 
         // 通过 IP 层发回去：src_ip 是对方 IP
         xip_out(XIP_PROTOCOL_ICMP, src_ip, packet);
-    } else if (icmp->type == 0) {
-        // Echo Reply：后面你要做“主动 ping 别人”时再用
+    } else if (icmp->type == 0 && icmp->code == 0) {
+        // Echo Reply: print information and RTT if timestamp present
+        uint16_t id = icmp->id;
+        uint16_t seq = icmp->seq;
+        // payload may contain a 32-bit timestamp (arp_timer_ticks) placed by sender
+        uint32_t rtt_ticks = 0;
+        if (packet->size >= sizeof(xicmp_hdr_t) + 4) {
+            // timestamp stored in network byte order (we used host uint32 directly), read as little-endian
+            uint8_t *pdata = packet->data + sizeof(xicmp_hdr_t);
+            // reconstruct uint32 (host endian assumed little-endian on target)
+            rtt_ticks = (uint32_t)pdata[0] | ((uint32_t)pdata[1] << 8) | ((uint32_t)pdata[2] << 16) | ((uint32_t)pdata[3] << 24);
+            uint32_t now = arp_timer_ticks;
+            uint32_t diff = (now >= rtt_ticks) ? (now - rtt_ticks) : 0;
+            printf("PING reply: %d.%d.%d.%d id=%u seq=%u rtt=%u ticks\n",
+                   src_ip[0], src_ip[1], src_ip[2], src_ip[3], id, seq, diff);
+        } else {
+            printf("PING reply: %d.%d.%d.%d id=%u seq=%u\n",
+                   src_ip[0], src_ip[1], src_ip[2], src_ip[3], id, seq);
+        }
     }
+}
+
+// Send one ICMP Echo Request to dest_ip. Returns 0 if packet sent, -1 if ARP unresolved
+int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq) {
+    // Check ARP cache first
+    const uint8_t *mac = arp_resolve(dest_ip);
+    if (!mac) {
+        // ARP in progress; arp_resolve has initiated request if needed
+        return -1;
+    }
+
+    // Build ICMP Echo Request with small payload (4-byte timestamp)
+    const uint16_t payload_len = 4; // store 32-bit tick
+    xnet_packet_t *packet = xnet_alloc_for_send((uint16_t)(sizeof(xicmp_hdr_t) + payload_len));
+    xicmp_hdr_t *icmp = (xicmp_hdr_t *)packet->data;
+
+    icmp->type = 8; // Echo Request
+    icmp->code = 0;
+    icmp->checksum = 0;
+    icmp->id = id;
+    icmp->seq = seq;
+
+    // store timestamp (arp_timer_ticks) in payload (little-endian)
+    uint8_t *pdata = packet->data + sizeof(xicmp_hdr_t);
+    uint32_t ts = arp_timer_ticks;
+    pdata[0] = (uint8_t)(ts & 0xFF);
+    pdata[1] = (uint8_t)((ts >> 8) & 0xFF);
+    pdata[2] = (uint8_t)((ts >> 16) & 0xFF);
+    pdata[3] = (uint8_t)((ts >> 24) & 0xFF);
+
+    // compute checksum
+    icmp->checksum = icmp_checksum16(icmp, packet->size);
+
+    // send via IP layer
+    xip_out(XIP_PROTOCOL_ICMP, dest_ip, packet);
+    return 0;
 }
 
 void xip_out(xip_protocol_t protocol,
