@@ -78,12 +78,12 @@ static xnet_err_t ethernet_init (void) {
 
 /**
  * ARP 模块初始化：设置协议栈自己的 IP
- * 当前实验写死为：192.168.108.200
+ * 当前实验写死为：192.168.232.200
  */
 static void arp_init(void) {
     netif_ip[0] = 192;
     netif_ip[1] = 168;
-    netif_ip[2] = 108;
+    netif_ip[2] = 232;
     netif_ip[3] = 200;
 }
 
@@ -123,6 +123,19 @@ static xnet_err_t ethernet_out_to(xnet_protocol_t protocol,
     memcpy(ether_hdr->dest, mac_addr, XNET_MAC_ADDR_SIZE);
     memcpy(ether_hdr->src, netif_mac, XNET_MAC_ADDR_SIZE);
     ether_hdr->protocol = swap_order16(protocol);
+
+    // 【新增修复】处理以太网最小帧长限制 (60 bytes)
+    if (packet->size < 60) {
+        // 计算需要填充的字节数
+        uint16_t padding_size = 60 - packet->size;
+        // 确保不超过最大缓冲区
+        if (packet->size + padding_size <= XNET_CFG_PACKET_MAX_SIZE) {
+            // 将 packet->data 及其后面的 padding 区域清零（通常 ARP 后面填 0 即可）
+            memset(packet->data + packet->size, 0, padding_size);
+            // 更新包的大小
+            packet->size += padding_size;
+        }
+    }
 
     return xnet_driver_send(packet);
 }
