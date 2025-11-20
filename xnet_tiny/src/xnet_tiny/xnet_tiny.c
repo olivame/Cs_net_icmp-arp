@@ -5,6 +5,7 @@
 #define min(a, b)               ((a) > (b) ? (b) : (a))
 #define swap_order16(v)         ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
 static void arp_send_request(const uint8_t ip[4]);
+static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet);
 static uint8_t netif_mac[XNET_MAC_ADDR_SIZE];               // 本机 MAC 地址
 static uint8_t netif_ip[4];                                 // 本机 IP 地址（网络字节序）
 static xnet_packet_t tx_packet, rx_packet;                  // 收发缓冲区
@@ -14,6 +15,9 @@ static const uint8_t broadcast_mac[XNET_MAC_ADDR_SIZE] = {  // 以太网广播 M
 
 static xarp_entry_t arp_table[XARP_TABLE_SIZE];
 static uint32_t arp_timer_ticks = 0;
+
+static uint16_t ip_checksum16(const void *buf, uint16_t len);
+static uint16_t icmp_checksum16(const void *buf, uint16_t len);
 
 /**
  * 分配一个发送用的数据包
@@ -194,7 +198,7 @@ static void arp_in(xnet_packet_t *packet) {
 
             memcpy(e->mac, arp->sender_mac, XNET_MAC_ADDR_SIZE);
             e->state = XARP_ENTRY_OK;
-            e->ttl = 100;        // 例如 100 个“tick”后过期
+            e->ttl = 1000;        // 例如 1000 个“tick”后过期
             e->retry = 0;
 
             printf("ARP update[%d]: %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -294,7 +298,8 @@ static void ethernet_in (xnet_packet_t * packet) {
             arp_in(packet);
             break;
         case XNET_PROTOCOL_IP:
-            // 预留给后续 IP 实验
+            remove_header(packet, sizeof(xether_hdr_t));
+            xip_in(packet);        // 把 IP 数据包交给 IP 层
             break;
         default:
             break;
@@ -328,3 +333,104 @@ void xnet_poll(void) {
     }
 }
 
+void xip_in(xnet_packet_t *packet) {
+    if (packet->size < sizeof(xip_hdr_t)) return;
+
+    xip_hdr_t *ip = (xip_hdr_t *)packet->data;
+
+    uint8_t ver  = ip->ver_hdrlen >> 4;
+    uint8_t ihl  = ip->ver_hdrlen & 0x0F;
+    uint16_t hdr_len = ihl * 4;
+    if (ver != 4 || hdr_len < sizeof(xip_hdr_t) || packet->size < hdr_len) return;
+
+    uint16_t chk = ip->hdr_checksum;
+    ip->hdr_checksum = 0;
+    if (ip_checksum16(ip, hdr_len) != chk) return;
+    ip->hdr_checksum = chk;
+
+    if (memcmp(ip->dest_ip, netif_ip, 4) != 0) return;
+
+    // 关键：先把对方 IP 拷出来，避免后面覆盖
+    uint8_t src_ip[4];
+    memcpy(src_ip, ip->src_ip, 4);
+
+    remove_header(packet, hdr_len);
+
+    if (ip->protocol == XIP_PROTOCOL_ICMP) {
+        xicmp_in(src_ip, packet);   // 传临时数组，而不是 ip->src_ip 指针
+    }
+}
+
+
+static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
+    if (packet->size < sizeof(xicmp_hdr_t)) return;
+
+    xicmp_hdr_t *icmp = (xicmp_hdr_t *)packet->data;
+
+    uint16_t recv_sum = icmp->checksum;
+    icmp->checksum = 0;
+    if (icmp_checksum16(icmp, packet->size) != recv_sum) return;
+
+    if (icmp->type == 8 && icmp->code == 0) {  // Echo Request
+        // 直接在原报文上构造 Reply
+        icmp->type = 0;
+        icmp->checksum = 0;
+        icmp->checksum = icmp_checksum16(icmp, packet->size);
+
+        // 通过 IP 层发回去：src_ip 是对方 IP
+        xip_out(XIP_PROTOCOL_ICMP, src_ip, packet);
+    } else if (icmp->type == 0) {
+        // Echo Reply：后面你要做“主动 ping 别人”时再用
+    }
+}
+
+void xip_out(xip_protocol_t protocol,
+             const uint8_t dest_ip[4],
+             xnet_packet_t *packet) {
+    // 先查 ARP：拿到对方 MAC（目前我们已经有 arp_resolve）
+    const uint8_t *mac = arp_resolve(dest_ip);
+    if (!mac) {
+        // 还没解析到 MAC，先等 ARP 表更新
+        return;
+    }
+
+    // 在 ICMP 前面加 IP 头
+    add_header(packet, sizeof(xip_hdr_t));
+    xip_hdr_t *ip = (xip_hdr_t *)packet->data;
+
+    ip->ver_hdrlen     = 0x45;
+    ip->tos            = 0;
+    ip->total_len      = swap_order16(packet->size);
+    ip->id             = 0;
+    ip->flags_fragment = 0;
+    ip->ttl            = 64;
+    ip->protocol       = protocol;
+    memcpy(ip->src_ip,  netif_ip, 4);
+    memcpy(ip->dest_ip, dest_ip, 4);
+    ip->hdr_checksum   = 0;
+    ip->hdr_checksum   = ip_checksum16(ip, sizeof(xip_hdr_t));
+
+    // 交给以太网层发送
+    ethernet_out_to(XNET_PROTOCOL_IP, mac, packet);
+}
+
+static uint16_t checksum16(const void *buf, uint16_t len) {
+    const uint16_t *data = buf;
+    uint32_t sum = 0;
+
+    while (len > 1) {
+        sum += *data++;
+        len -= 2;
+    }
+    if (len) {
+        sum += *(const uint8_t *)data;
+    }
+
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+static uint16_t ip_checksum16(const void *buf, uint16_t len)   { return checksum16(buf, len); }
+static uint16_t icmp_checksum16(const void *buf, uint16_t len) { return checksum16(buf, len); }

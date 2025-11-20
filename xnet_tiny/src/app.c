@@ -7,9 +7,9 @@ int main (void) {
 
     uint8_t ip_list[][4] = {
         {192, 168, 108, 132},   // 虚拟机
-        {192, 168, 108, 1},     // 宿主机
+        //{192, 168, 108, 1},     // 宿主机
     };
-    int ip_count = 2;
+    int ip_count = 1;
 
     printf("xnet running\n");
     while (1) {

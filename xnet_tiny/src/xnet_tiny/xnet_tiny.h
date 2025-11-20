@@ -8,6 +8,35 @@
 
 #pragma pack(1)
 
+#define XNET_IP_ADDR_SIZE 4
+
+typedef struct _xip_hdr_t {
+    uint8_t  ver_hdrlen;      // 版本(4) + 头长(4) -> 固定 0x45
+    uint8_t  tos;
+    uint16_t total_len;
+    uint16_t id;
+    uint16_t flags_fragment;
+    uint8_t  ttl;
+    uint8_t  protocol;        // 1 = ICMP
+    uint16_t hdr_checksum;
+    uint8_t  src_ip[XNET_IP_ADDR_SIZE];
+    uint8_t  dest_ip[XNET_IP_ADDR_SIZE];
+} xip_hdr_t;
+
+typedef struct _xicmp_hdr_t {
+    uint8_t  type;       // 8=Request, 0=Reply
+    uint8_t  code;       // Echo 固定为 0
+    uint16_t checksum;
+    uint16_t id;
+    uint16_t seq;
+    // 后面紧跟 data
+} xicmp_hdr_t;
+
+typedef enum _xip_protocol_t {
+    XIP_PROTOCOL_ICMP = 1,
+} xip_protocol_t;
+
+
 // MAC 地址长度
 #define XNET_MAC_ADDR_SIZE              6
 
@@ -90,5 +119,11 @@ void arp_table_timer(void);
 void xnet_init (void);
 void xnet_poll(void);
 
+void xip_in(xnet_packet_t *packet);
+void xip_out(xip_protocol_t protocol,
+             const uint8_t dest_ip[4],
+             xnet_packet_t *packet);
+
+             
 #endif // XNET_TINY_H
 
