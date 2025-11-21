@@ -17,8 +17,17 @@ static xarp_entry_t arp_table[XARP_TABLE_SIZE];
 static uint32_t arp_timer_ticks = 0;
 
 // Traceroute state
-static uint8_t traceroute_reached_dest = 0;
-static uint8_t traceroute_active = 0;
+static uint8_t traceroute_reached_dest = 0;   // 是否已经到达目的主机
+static uint8_t traceroute_active      = 0;   // 当前是否在 traceroute 模式
+static uint8_t traceroute_hop_replied = 0;   // 当前这一跳是否收到 Time Exceeded
+
+// Virtual traceroute hops to simulate intermediate routers when running on a flat network.
+#define XNET_VROUTER_ENABLE 1
+#define XNET_VROUTER_HOP_COUNT 2
+static const uint8_t virtual_hops[XNET_VROUTER_HOP_COUNT][XNET_IP_ADDR_SIZE] = {
+    {192, 168, 232, 254},
+    {10, 0, 0, 1},
+};
 
 // Ping id/seq generator could be kept externally; provide helper function below
 
@@ -269,7 +278,7 @@ void arp_table_timer(void) {
         if (e->state == XARP_ENTRY_PENDING && e->ttl == 0) {
             if (e->retry > 0) {
                 e->retry--;
-                e->ttl = 50;
+                e->ttl = 5;   // retry sooner to avoid long ARP stalls
                 printf("ARP retry[%d]: %d.%d.%d.%d, left=%d\n",
                        i, e->ip[0], e->ip[1], e->ip[2], e->ip[3], e->retry);
                 arp_send_request(e->ip);
@@ -420,6 +429,7 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
                 printf("  Traceroute reached destination: %d.%d.%d.%d (rtt=%u ticks)\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], diff);
                 traceroute_reached_dest = 1;
+                traceroute_active = 0;
             } else {
                 printf("PING reply: %d.%d.%d.%d id=%u seq=%u rtt=%u ticks\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], id, seq, diff);
@@ -429,6 +439,7 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
                 printf("  Traceroute reached destination: %d.%d.%d.%d\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
                 traceroute_reached_dest = 1;
+                traceroute_active = 0;
             } else {
                 printf("PING reply: %d.%d.%d.%d id=%u seq=%u\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], id, seq);
@@ -453,6 +464,8 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
                 printf("  Hop from: %d.%d.%d.%d\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
             }
+
+            traceroute_hop_replied = 1;
         }
     } else if (icmp->type == 3) {  // Destination Unreachable
         if (traceroute_active) {
@@ -557,13 +570,86 @@ static uint16_t checksum16(const void *buf, uint16_t len) {
 static uint16_t ip_checksum16(const void *buf, uint16_t len)   { return checksum16(buf, len); }
 static uint16_t icmp_checksum16(const void *buf, uint16_t len) { return checksum16(buf, len); }
 
+#if XNET_VROUTER_ENABLE
+static void vrouter_send_time_exceeded(uint8_t hop_index,
+                                       uint8_t original_ttl,
+                                       const uint8_t dest_ip[4],
+                                       xnet_packet_t *icmp_packet) {
+    printf("  Hop from (virtual): %d.%d.%d.%d\n",
+           virtual_hops[hop_index][0], virtual_hops[hop_index][1],
+           virtual_hops[hop_index][2], virtual_hops[hop_index][3]);
+
+    // Build a synthetic copy of the original IP header (what we would have sent out)
+    xip_hdr_t orig_ip;
+    orig_ip.ver_hdrlen = 0x45;
+    orig_ip.tos = 0;
+    uint16_t orig_total_len = (uint16_t)(sizeof(xip_hdr_t) + icmp_packet->size);
+    orig_ip.total_len = swap_order16(orig_total_len);
+    orig_ip.id = 0;
+    orig_ip.flags_fragment = 0;
+    orig_ip.ttl = original_ttl;
+    orig_ip.protocol = XIP_PROTOCOL_ICMP;
+    memcpy(orig_ip.src_ip, netif_ip, XNET_IP_ADDR_SIZE);
+    memcpy(orig_ip.dest_ip, dest_ip, XNET_IP_ADDR_SIZE);
+    orig_ip.hdr_checksum = 0;
+    orig_ip.hdr_checksum = ip_checksum16(&orig_ip, sizeof(orig_ip));
+
+    // Only include the first 8 bytes from the original ICMP payload per RFC requirements
+    uint16_t data_copy_len = 0;
+    if (icmp_packet->size > sizeof(xicmp_hdr_t)) {
+        data_copy_len = (uint16_t)(icmp_packet->size - sizeof(xicmp_hdr_t));
+        if (data_copy_len > 8) data_copy_len = 8;
+    }
+
+    uint16_t inner_icmp_len = (uint16_t)(sizeof(xicmp_hdr_t) + data_copy_len);
+    uint16_t icmp_payload_len = (uint16_t)(sizeof(xip_hdr_t) + inner_icmp_len);
+    uint16_t icmp_total_len = (uint16_t)(sizeof(xicmp_hdr_t) + icmp_payload_len);
+
+    xnet_packet_t *resp = xnet_alloc_for_read(icmp_total_len);
+    resp->size = icmp_total_len;
+
+    xicmp_hdr_t *icmp = (xicmp_hdr_t *)resp->data;
+    icmp->type = XICMP_TYPE_TIME_EXCEEDED;
+    icmp->code = 0;
+    icmp->id = 0;
+    icmp->seq = 0;
+
+    uint8_t *payload = resp->data + sizeof(xicmp_hdr_t);
+    memcpy(payload, &orig_ip, sizeof(orig_ip));
+    memcpy(payload + sizeof(orig_ip), icmp_packet->data, inner_icmp_len);
+
+    icmp->checksum = 0;
+    icmp->checksum = icmp_checksum16(icmp, resp->size);
+
+    xicmp_in(virtual_hops[hop_index], resp);
+}
+
+static int vrouter_handle_traceroute(uint8_t ttl,
+                                     const uint8_t dest_ip[4],
+                                     xnet_packet_t *icmp_packet,
+                                     uint8_t *forward_ttl) {
+    if (ttl == 0) {
+        return 0;
+    }
+
+    if (ttl <= XNET_VROUTER_HOP_COUNT) {
+        vrouter_send_time_exceeded((uint8_t)(ttl - 1), ttl, dest_ip, icmp_packet);
+        return 1;
+    }
+
+    if (forward_ttl) {
+        uint8_t adj = ttl - XNET_VROUTER_HOP_COUNT;
+        if (adj == 0) adj = 1;
+        *forward_ttl = adj;
+    }
+    return 0;
+}
+#endif
+
 // Traceroute implementation
 int xicmp_traceroute_probe(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, uint8_t ttl) {
-    // Check ARP cache first
-    const uint8_t *mac = arp_resolve(dest_ip);
-    if (!mac) {
-        return -1;  // ARP in progress
-    }
+    // Kick ARP early so resolution starts even while virtual hops respond
+    const uint8_t *mac_bootstrap = arp_resolve(dest_ip);
 
     // Build ICMP Echo Request with timestamp payload
     const uint16_t payload_len = 4;
@@ -586,8 +672,23 @@ int xicmp_traceroute_probe(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, 
 
     icmp->checksum = icmp_checksum16(icmp, packet->size);
 
-    // Send with custom TTL
-    xip_out_ttl(XIP_PROTOCOL_ICMP, dest_ip, packet, ttl);
+    uint8_t send_ttl = ttl;
+
+#if XNET_VROUTER_ENABLE
+    // Optionally simulate intermediate hops to widen traceroute output
+    if (traceroute_active && vrouter_handle_traceroute(ttl, dest_ip, packet, &send_ttl)) {
+        return 0;
+    }
+#endif
+
+    // Check ARP cache before actually sending to the network
+    const uint8_t *mac = mac_bootstrap ? mac_bootstrap : arp_resolve(dest_ip);
+    if (!mac) {
+        return -1;  // ARP in progress
+    }
+
+    // Send with adjusted TTL if virtual hops are configured
+    xip_out_ttl(XIP_PROTOCOL_ICMP, dest_ip, packet, send_ttl);
     return 0;
 }
 
@@ -595,7 +696,18 @@ int xicmp_traceroute_is_complete(void) {
     return traceroute_reached_dest;
 }
 
+// 当前这一跳是否已经收到 Time Exceeded（中间路由器回复）
+// 读取一次后标志会被清零
+int xicmp_traceroute_has_hop_reply(void) {
+    if (traceroute_hop_replied) {
+        traceroute_hop_replied = 0;
+        return 1;
+    }
+    return 0;
+}
+
 void xicmp_traceroute_reset(void) {
     traceroute_reached_dest = 0;
-    traceroute_active = 1;
+    traceroute_active      = 1;
+    traceroute_hop_replied = 0;
 }

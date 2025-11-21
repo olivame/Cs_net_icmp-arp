@@ -145,6 +145,10 @@ int xicmp_traceroute_probe(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, 
 // Check if traceroute has reached destination
 int xicmp_traceroute_is_complete(void);
 
+// 当前 TTL 是否已经收到 Time Exceeded（中间路由器回复）
+// 返回非 0 表示已经收到，读一次后会自动清零
+int xicmp_traceroute_has_hop_reply(void);
+
 // Get traceroute hop information
 void xicmp_traceroute_reset(void);
 
