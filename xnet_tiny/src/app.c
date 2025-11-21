@@ -10,9 +10,9 @@ int main (void) {
 
     // 目标 IP
     uint8_t dest_ip[4] = {192, 168, 232, 128}; 
-    
+
     // 选择模式：0=Ping, 1=Traceroute
-    int mode = 0;
+    int mode = 1;
     
     printf("xnet running. Target: %d.%d.%d.%d\n", 
             dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3]);
