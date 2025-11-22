@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h> 
+#include <windows.h>    
 #include "xnet_tiny.h"
 
 #define min(a, b)               ((a) > (b) ? (b) : (a))
@@ -20,7 +21,18 @@ static uint32_t arp_timer_ticks = 0;
 static uint8_t traceroute_reached_dest = 0;   // 是否已经到达目的主机
 static uint8_t traceroute_active      = 0;   // 当前是否在 traceroute 模式
 static uint8_t traceroute_hop_replied = 0;   // 当前这一跳是否收到 Time Exceeded
+static int last_icmp_rtt              = -1;  // 最近一次 ICMP Echo Reply 的 RTT（ms）
 
+static uint32_t xnet_now_ms(void) {
+    // GetTickCount64 返回毫秒级时间戳
+    return (uint32_t)GetTickCount64();
+}
+
+int xicmp_get_last_rtt(void) {
+    int rtt = last_icmp_rtt;
+    last_icmp_rtt = -1;
+    return rtt;
+}
 // Virtual traceroute hops to simulate intermediate routers when running on a flat network.
 #define XNET_VROUTER_ENABLE 1
 #define XNET_VROUTER_HOP_COUNT 2
@@ -423,15 +435,16 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
             uint8_t *pdata = packet->data + sizeof(xicmp_hdr_t);
             // reconstruct uint32 (host endian assumed little-endian on target)
             rtt_ticks = (uint32_t)pdata[0] | ((uint32_t)pdata[1] << 8) | ((uint32_t)pdata[2] << 16) | ((uint32_t)pdata[3] << 24);
-            uint32_t now = arp_timer_ticks;
+            uint32_t now = xnet_now_ms();
             uint32_t diff = (now >= rtt_ticks) ? (now - rtt_ticks) : 0;
+            last_icmp_rtt = (int)diff;
             if (traceroute_active) {
-                printf("  Traceroute reached destination: %d.%d.%d.%d (rtt=%u ticks)\n",
+                printf("  Traceroute reached destination: %d.%d.%d.%d (rtt=%u ms)\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], diff);
                 traceroute_reached_dest = 1;
                 traceroute_active = 0;
             } else {
-                printf("PING reply: %d.%d.%d.%d id=%u seq=%u rtt=%u ticks\n",
+                printf("PING reply: %d.%d.%d.%d id=%u seq=%u rtt=%u ms\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], id, seq, diff);
             }
         } else {
@@ -453,12 +466,17 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
             // Time Exceeded includes original IP header + 8 bytes of original data
             // Skip to the ICMP echo request data (after 2nd IP + ICMP headers)
             if (packet->size >= sizeof(xicmp_hdr_t) + sizeof(xip_hdr_t) + sizeof(xicmp_hdr_t) + 4) {
-                uint8_t *encap_data = packet->data + sizeof(xicmp_hdr_t) + sizeof(xip_hdr_t) + sizeof(xicmp_hdr_t);
-                rtt_ticks = (uint32_t)encap_data[0] | ((uint32_t)encap_data[1] << 8) | 
-                            ((uint32_t)encap_data[2] << 16) | ((uint32_t)encap_data[3] << 24);
-                uint32_t now = arp_timer_ticks;
+                uint8_t *encap_data = packet->data
+                                     + sizeof(xicmp_hdr_t)
+                                     + sizeof(xip_hdr_t)
+                                     + sizeof(xicmp_hdr_t);
+                rtt_ticks = (uint32_t)encap_data[0]
+                          | ((uint32_t)encap_data[1] << 8)
+                          | ((uint32_t)encap_data[2] << 16)
+                          | ((uint32_t)encap_data[3] << 24);
+                uint32_t now = xnet_now_ms();             // ← 改这里
                 uint32_t diff = (now >= rtt_ticks) ? (now - rtt_ticks) : 0;
-                printf("  Hop from: %d.%d.%d.%d (rtt=%u ticks)\n",
+                printf("  Hop from: %d.%d.%d.%d (rtt=%u ms)\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], diff);
             } else {
                 printf("  Hop from: %d.%d.%d.%d\n",
@@ -477,7 +495,7 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
 }
 
 // Send one ICMP Echo Request to dest_ip. Returns 0 if packet sent, -1 if ARP unresolved
-int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq) {
+int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, uint16_t data_size) {
     // Check ARP cache first
     const uint8_t *mac = arp_resolve(dest_ip);
     if (!mac) {
@@ -485,8 +503,17 @@ int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq) {
         return -1;
     }
 
-    // Build ICMP Echo Request with small payload (4-byte timestamp)
-    const uint16_t payload_len = 4; // store 32-bit tick
+    // Ensure payload has room for timestamp and stays within buffer limits
+    uint16_t payload_len = (data_size < 4) ? 4 : data_size;
+    const uint16_t max_payload = XNET_CFG_PACKET_MAX_SIZE
+                                 - (uint16_t)sizeof(xether_hdr_t)
+                                 - (uint16_t)sizeof(xip_hdr_t)
+                                 - (uint16_t)sizeof(xicmp_hdr_t);
+    if (payload_len > max_payload) {
+        payload_len = max_payload;
+    }
+
+    // Build ICMP Echo Request with timestamp payload
     xnet_packet_t *packet = xnet_alloc_for_send((uint16_t)(sizeof(xicmp_hdr_t) + payload_len));
     xicmp_hdr_t *icmp = (xicmp_hdr_t *)packet->data;
 
@@ -498,11 +525,14 @@ int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq) {
 
     // store timestamp (arp_timer_ticks) in payload (little-endian)
     uint8_t *pdata = packet->data + sizeof(xicmp_hdr_t);
-    uint32_t ts = arp_timer_ticks;
+    uint32_t ts = xnet_now_ms();      // 用毫秒时间戳
     pdata[0] = (uint8_t)(ts & 0xFF);
     pdata[1] = (uint8_t)((ts >> 8) & 0xFF);
     pdata[2] = (uint8_t)((ts >> 16) & 0xFF);
     pdata[3] = (uint8_t)((ts >> 24) & 0xFF);
+    if (payload_len > 4) {
+        memset(pdata + 4, 'A', payload_len - 4);  // 填充负载模拟真实流量
+    }
 
     // compute checksum
     icmp->checksum = icmp_checksum16(icmp, packet->size);
@@ -628,19 +658,26 @@ static int vrouter_handle_traceroute(uint8_t ttl,
                                      const uint8_t dest_ip[4],
                                      xnet_packet_t *icmp_packet,
                                      uint8_t *forward_ttl) {
-    if (ttl == 0) {
-        return 0;
+    uint8_t cur_ttl = ttl;
+
+    // Walk the virtual hop chain, decrementing TTL just like real routers.
+    for (uint8_t i = 0; i < XNET_VROUTER_HOP_COUNT; i++) {
+        if (cur_ttl == 0) {
+            vrouter_send_time_exceeded(i, 0, dest_ip, icmp_packet);
+            return 1;
+        }
+
+        cur_ttl--;  // router consumes one hop
+
+        if (cur_ttl == 0) {
+            vrouter_send_time_exceeded(i, 0, dest_ip, icmp_packet);
+            return 1;
+        }
     }
 
-    if (ttl <= XNET_VROUTER_HOP_COUNT) {
-        vrouter_send_time_exceeded((uint8_t)(ttl - 1), ttl, dest_ip, icmp_packet);
-        return 1;
-    }
-
+    // Forward toward the real destination with the remaining TTL.
     if (forward_ttl) {
-        uint8_t adj = ttl - XNET_VROUTER_HOP_COUNT;
-        if (adj == 0) adj = 1;
-        *forward_ttl = adj;
+        *forward_ttl = (cur_ttl == 0) ? 1 : cur_ttl;
     }
     return 0;
 }
@@ -664,7 +701,7 @@ int xicmp_traceroute_probe(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, 
 
     // Store timestamp
     uint8_t *pdata = packet->data + sizeof(xicmp_hdr_t);
-    uint32_t ts = arp_timer_ticks;
+    uint32_t ts = xnet_now_ms();      // 用毫秒时间戳
     pdata[0] = (uint8_t)(ts & 0xFF);
     pdata[1] = (uint8_t)((ts >> 8) & 0xFF);
     pdata[2] = (uint8_t)((ts >> 16) & 0xFF);

@@ -134,9 +134,12 @@ void xip_out_ttl(xip_protocol_t protocol,
                  xnet_packet_t *packet,
                  uint8_t ttl);
 
-// Send a single ICMP Echo Request (ping)
+// Send a single ICMP Echo Request (ping) with configurable payload size
 // Returns 0 on success (packet sent), -1 if destination MAC unknown (ARP in progress)
-int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq);
+int xicmp_ping(const uint8_t dest_ip[4], uint16_t id, uint16_t seq, uint16_t data_size);
+
+// Get RTT (ms) of the last received ICMP Echo Reply; returns -1 if none pending
+int xicmp_get_last_rtt(void);
 
 // Traceroute: send ICMP Echo with specific TTL
 // Returns 0 on success, -1 if ARP unresolved
@@ -154,4 +157,3 @@ void xicmp_traceroute_reset(void);
 
              
 #endif // XNET_TINY_H
-
