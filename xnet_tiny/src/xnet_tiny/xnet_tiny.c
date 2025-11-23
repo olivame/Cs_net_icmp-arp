@@ -635,22 +635,39 @@ static void vrouter_send_time_exceeded(uint8_t hop_index,
     uint16_t icmp_payload_len = (uint16_t)(sizeof(xip_hdr_t) + inner_icmp_len);
     uint16_t icmp_total_len = (uint16_t)(sizeof(xicmp_hdr_t) + icmp_payload_len);
 
-    xnet_packet_t *resp = xnet_alloc_for_read(icmp_total_len);
-    resp->size = icmp_total_len;
-
+    // Build ICMP payload as before
+    xnet_packet_t *resp = xnet_alloc_for_send((uint16_t)(sizeof(xicmp_hdr_t) + sizeof(orig_ip) + inner_icmp_len));
     xicmp_hdr_t *icmp = (xicmp_hdr_t *)resp->data;
     icmp->type = XICMP_TYPE_TIME_EXCEEDED;
     icmp->code = 0;
     icmp->id = 0;
     icmp->seq = 0;
-
     uint8_t *payload = resp->data + sizeof(xicmp_hdr_t);
     memcpy(payload, &orig_ip, sizeof(orig_ip));
     memcpy(payload + sizeof(orig_ip), icmp_packet->data, inner_icmp_len);
-
     icmp->checksum = 0;
+    resp->size = (uint16_t)(sizeof(xicmp_hdr_t) + sizeof(orig_ip) + inner_icmp_len);
     icmp->checksum = icmp_checksum16(icmp, resp->size);
 
+    // Wrap with IP header so it goes out to the NIC
+    add_header(resp, sizeof(xip_hdr_t));
+    xip_hdr_t *ip = (xip_hdr_t *)resp->data;
+    ip->ver_hdrlen     = 0x45;
+    ip->tos            = 0;
+    ip->total_len      = swap_order16(resp->size);
+    ip->id             = 0;
+    ip->flags_fragment = 0;
+    ip->ttl            = 64;
+    ip->protocol       = XIP_PROTOCOL_ICMP;
+    memcpy(ip->src_ip,  virtual_hops[hop_index], 4); // virtual router IP
+    memcpy(ip->dest_ip, netif_ip, 4);                // back to traceroute source
+    ip->hdr_checksum   = 0;
+    ip->hdr_checksum   = ip_checksum16(ip, sizeof(*ip));
+
+    // Send onto the wire so sniffers can see it
+    ethernet_out_to(XNET_PROTOCOL_IP, netif_mac, resp);
+
+    // Optional: still inject locally to keep current traceroute state machine instant
     xicmp_in(virtual_hops[hop_index], resp);
 }
 

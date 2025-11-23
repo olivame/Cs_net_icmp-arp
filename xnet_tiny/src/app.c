@@ -69,10 +69,14 @@ int main (void) {
 
     // 带宽/抖动测量专用变量
     int bw_sizes[] = {64, 256, 512, 1024};
+    double bw_results[4] = {0};
     int bw_stage = 0;
 
     int jitter_count = 0;
     const int jitter_max_count = 20;
+    int jitter_seqs[20] = {0};
+    int jitter_rtts[20] = {0};
+    double jitter_vals[20] = {0};
     int last_jitter_rtt = -1;
     double total_jitter = 0;
     int valid_jitter_samples = 0;
@@ -170,6 +174,7 @@ int main (void) {
 
                         if (rtt > 0) {
                             double kbps = (double)(size * 8) / (double)rtt;
+                            bw_results[bw_stage] = kbps;
                             printf("Payload %4d bytes: RTT=%d ms, Bandwidth=~%.2f kbps\n",
                                    size, rtt, kbps);
                         } else {
@@ -183,6 +188,25 @@ int main (void) {
                     }
                 } else {
                     printf("\nBandwidth estimation complete.\n");
+
+                    FILE *fp = fopen("plot_bw.py", "w");
+                    if (fp) {
+                        fprintf(fp, "import matplotlib.pyplot as plt\n");
+                        fprintf(fp, "sizes = ['64', '256', '512', '1024']\n");
+                        fprintf(fp, "kbps = [%.2f, %.2f, %.2f, %.2f]\n", bw_results[0], bw_results[1], bw_results[2], bw_results[3]);
+                        fprintf(fp, "plt.figure(figsize=(10, 6))\n");
+                        fprintf(fp, "plt.bar(sizes, kbps, color='skyblue', edgecolor='black')\n");
+                        fprintf(fp, "plt.title('ICMP Bandwidth Estimation')\n");
+                        fprintf(fp, "plt.xlabel('Packet Size (bytes)')\n");
+                        fprintf(fp, "plt.ylabel('Bandwidth (kbps)')\n");
+                        fprintf(fp, "for i, v in enumerate(kbps):\n");
+                        fprintf(fp, "    plt.text(i, v + 1, f'{v:.2f} kbps', ha='center')\n");
+                        fprintf(fp, "plt.show()\n");
+                        fclose(fp);
+                        system("python plot_bw.py");
+                        remove("plot_bw.py");
+                    }
+
                     return 0;
                     mode = MODE_IDLE;
                 }
@@ -200,7 +224,9 @@ int main (void) {
                         xicmp_ping(dest_ip, 3000, seq, 64);
 
                         int rtt = wait_for_reply(1000);
+                        jitter_seqs[jitter_count] = jitter_count + 1;
                         if (rtt >= 0) {
+                            jitter_rtts[jitter_count] = rtt;
                             if (last_jitter_rtt != -1) {
                                 int diff = abs(rtt - last_jitter_rtt);
                                 total_jitter += diff;
@@ -209,17 +235,65 @@ int main (void) {
 
                                 printf("Seq=%d RTT=%d ms | Diff=%d ms | Avg Jitter=%.2f ms\n",
                                        jitter_count + 1, rtt, diff, avg_jitter);
+                                jitter_vals[jitter_count] = (double)diff;
                             } else {
                                 printf("Seq=%d RTT=%d ms (First packet)\n",
                                        jitter_count + 1, rtt);
+                                jitter_vals[jitter_count] = 0.0;
                             }
                             last_jitter_rtt = rtt;
                         } else {
                             printf("Seq=%d Timeout\n", jitter_count + 1);
+                            jitter_rtts[jitter_count] = 0;
+                            jitter_vals[jitter_count] = 0.0;
                         }
                         jitter_count++;
                     } else {
                         printf("\nJitter measurement complete.\n");
+
+                        FILE *fp = fopen("plot_jitter.py", "w");
+                        if (fp) {
+                            fprintf(fp, "import matplotlib.pyplot as plt\n");
+                            
+                            fprintf(fp, "seqs = [");
+                            for(int i=0; i<jitter_count; i++) fprintf(fp, "%d,", jitter_seqs[i]);
+                            fprintf(fp, "]\n");
+                            
+                            fprintf(fp, "rtts = [");
+                            for(int i=0; i<jitter_count; i++) fprintf(fp, "%d,", jitter_rtts[i]);
+                            fprintf(fp, "]\n");
+                            
+                            fprintf(fp, "jitters = [");
+                            for(int i=0; i<jitter_count; i++) fprintf(fp, "%.2f,", jitter_vals[i]);
+                            fprintf(fp, "]\n");
+
+                            fprintf(fp, "plt.figure(figsize=(10, 8))\n");
+                            
+                            fprintf(fp, "plt.subplot(2, 1, 1)\n");
+                            fprintf(fp, "plt.plot(seqs, rtts, marker='o', color='blue', label='RTT')\n");
+                            fprintf(fp, "if len(rtts) > 0: plt.axhline(y=sum(rtts)/len(rtts), color='r', linestyle='--', label=f'Avg RTT: {sum(rtts)/len(rtts):.2f} ms')\n");
+                            fprintf(fp, "plt.title('ICMP Network Quality - RTT Variation')\n");
+                            fprintf(fp, "plt.ylabel('Round Trip Time (ms)')\n");
+                            fprintf(fp, "plt.legend()\n");
+                            fprintf(fp, "plt.grid(True, linestyle='--', alpha=0.7)\n");
+                            
+                            fprintf(fp, "plt.subplot(2, 1, 2)\n");
+                            fprintf(fp, "plt.bar(seqs, jitters, color='orange', alpha=0.7, label='Jitter')\n");
+                            fprintf(fp, "if len(jitters) > 0: plt.axhline(y=sum(jitters)/len(jitters), color='purple', linestyle='--', label=f'Avg Jitter: {sum(jitters)/len(jitters):.2f} ms')\n");
+                            fprintf(fp, "plt.title('Jitter Variation')\n");
+                            fprintf(fp, "plt.xlabel('Packet Sequence')\n");
+                            fprintf(fp, "plt.ylabel('Jitter (ms)')\n");
+                            fprintf(fp, "plt.legend()\n");
+                            fprintf(fp, "plt.grid(True, linestyle='--', alpha=0.7)\n");
+                            
+                            fprintf(fp, "plt.tight_layout()\n");
+                            fprintf(fp, "plt.show()\n");
+                            
+                            fclose(fp);
+                            system("python plot_jitter.py");
+                            remove("plot_jitter.py");
+                        }
+
                         mode = MODE_IDLE;
                     }
                 }
