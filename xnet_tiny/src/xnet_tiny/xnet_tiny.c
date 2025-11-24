@@ -3,9 +3,11 @@
 #include <windows.h>    
 #include "xnet_tiny.h"
 
+#undef min
 #define min(a, b)               ((a) > (b) ? (b) : (a))
 #define swap_order16(v)         ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
 static void arp_send_request(const uint8_t ip[4]);
+
 static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet);
 static uint8_t netif_mac[XNET_MAC_ADDR_SIZE];               // 本机 MAC 地址
 static uint8_t netif_ip[4];                                 // 本机 IP 地址（网络字节序）
@@ -16,6 +18,34 @@ static const uint8_t broadcast_mac[XNET_MAC_ADDR_SIZE] = {  // 以太网广播 M
 
 static xarp_entry_t arp_table[XARP_TABLE_SIZE];
 static uint32_t arp_timer_ticks = 0;
+
+// Print current ARP table for debugging
+static void print_arp_table(void) {
+    printf("--- ARP Table ---\n");
+    for (int i = 0; i < XARP_TABLE_SIZE; i++) {
+        xarp_entry_t *e = &arp_table[i];
+        const char *state_str = "FREE";
+        if (e->state == XARP_ENTRY_PENDING) state_str = "PENDING";
+        else if (e->state == XARP_ENTRY_OK) state_str = "OK";
+
+        printf("[%d] %3s ", i, state_str);
+        if (e->state != XARP_ENTRY_FREE) {
+            printf("%d.%d.%d.%d ", e->ip[0], e->ip[1], e->ip[2], e->ip[3]);
+        } else {
+            printf("-.-.-.- ");
+        }
+
+        if (e->state == XARP_ENTRY_OK) {
+            printf("%02X:%02X:%02X:%02X:%02X:%02X ",
+                   e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+        } else {
+            printf("--:--:--:--:--:-- ");
+        }
+
+        printf("ttl=%u retry=%u\n", (unsigned)e->ttl, (unsigned)e->retry);
+    }
+    printf("-----------------\n");
+}
 
 // Traceroute state
 static uint8_t traceroute_reached_dest = 0;   // 是否已经到达目的主机
@@ -104,7 +134,7 @@ static xnet_err_t ethernet_init (void) {
 static void arp_init(void) {
     netif_ip[0] = 192;
     netif_ip[1] = 168;
-    netif_ip[2] = 232;
+    netif_ip[2] = 75;
     netif_ip[3] = 200;
 }
 
@@ -159,6 +189,75 @@ static xnet_err_t ethernet_out_to(xnet_protocol_t protocol,
     }
 
     return xnet_driver_send(packet);
+}
+
+// Generate and send ICMP Destination Unreachable (Host Unreachable)
+// to self, simulating a router response when ARP fails.
+static void send_host_unreachable(const uint8_t *target_ip) {
+    // 1. Construct the "original" packet that failed (IP + 8 bytes of payload)
+    uint16_t orig_data_len = 8; 
+    uint16_t orig_total_len = (uint16_t)(sizeof(xip_hdr_t) + orig_data_len);
+    
+    // 2. Allocate buffer for the ICMP Error packet
+    // Layout: [Ethernet] [IP] [ICMP Error Header] [Original IP] [Original Data 8 bytes]
+    uint16_t icmp_payload_len = (uint16_t)(sizeof(xip_hdr_t) + orig_data_len);
+    uint16_t total_len = (uint16_t)(sizeof(xicmp_hdr_t) + icmp_payload_len);
+    
+    xnet_packet_t *packet = xnet_alloc_for_send(total_len);
+    
+    // 3. Fill ICMP Error Header
+    xicmp_hdr_t *icmp = (xicmp_hdr_t *)packet->data;
+    icmp->type = 3; // Dest Unreachable
+    icmp->code = 1; // Host Unreachable
+    icmp->id = 0;
+    icmp->seq = 0;
+    
+    // 4. Fill Payload (Original IP + 8 bytes)
+    uint8_t *payload = packet->data + sizeof(xicmp_hdr_t);
+    
+    // Synthetic Original IP
+    xip_hdr_t *orig_ip = (xip_hdr_t *)payload;
+    orig_ip->ver_hdrlen = 0x45;
+    orig_ip->tos = 0;
+    orig_ip->total_len = swap_order16(orig_total_len);
+    orig_ip->id = 0;
+    orig_ip->flags_fragment = 0;
+    orig_ip->ttl = 64;
+    orig_ip->protocol = XIP_PROTOCOL_ICMP;
+    memcpy(orig_ip->src_ip, netif_ip, 4);
+    memcpy(orig_ip->dest_ip, target_ip, 4);
+    orig_ip->hdr_checksum = 0;
+    orig_ip->hdr_checksum = ip_checksum16(orig_ip, sizeof(xip_hdr_t));
+    
+    // Synthetic Original Data (8 bytes) - assume Echo Request
+    uint8_t *orig_data = payload + sizeof(xip_hdr_t);
+    memset(orig_data, 0, orig_data_len);
+    orig_data[0] = 8; // Echo Request type
+    
+    // 5. Checksum for ICMP Error
+    icmp->checksum = 0;
+    icmp->checksum = icmp_checksum16(icmp, total_len);
+    
+    // 6. Wrap in IP Header (From Me To Me)
+    add_header(packet, sizeof(xip_hdr_t));
+    xip_hdr_t *ip = (xip_hdr_t *)packet->data;
+    ip->ver_hdrlen = 0x45;
+    ip->tos = 0;
+    ip->total_len = swap_order16(packet->size);
+    ip->id = 0;
+    ip->flags_fragment = 0;
+    ip->ttl = 64;
+    ip->protocol = XIP_PROTOCOL_ICMP;
+    memcpy(ip->src_ip, netif_ip, 4);
+    memcpy(ip->dest_ip, netif_ip, 4);
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum = ip_checksum16(ip, sizeof(xip_hdr_t));
+    
+    // 7. Send to Ethernet (Loopback to self)
+    ethernet_out_to(XNET_PROTOCOL_IP, netif_mac, packet);
+    
+    printf("Generated ICMP Host Unreachable for %d.%d.%d.%d\n",
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
 }
 
 /**
@@ -238,7 +337,7 @@ static void arp_in(xnet_packet_t *packet) {
 
             memcpy(e->mac, arp->sender_mac, XNET_MAC_ADDR_SIZE);
             e->state = XARP_ENTRY_OK;
-            e->ttl = 1000;        // 例如 1000 个“tick”后过期
+            e->ttl = 100;        // 100 个“tick”后过期
             e->retry = 0;
 
             printf("ARP update[%d]: %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -246,6 +345,8 @@ static void arp_in(xnet_packet_t *packet) {
                arp->sender_ip[0], arp->sender_ip[1], arp->sender_ip[2], arp->sender_ip[3],
                arp->sender_mac[0], arp->sender_mac[1], arp->sender_mac[2],
                arp->sender_mac[3], arp->sender_mac[4], arp->sender_mac[5]);
+            // Print full ARP table after update
+            print_arp_table();
         }
     }
 }
@@ -268,10 +369,12 @@ const uint8_t * arp_resolve(const uint8_t ip[4]) {
         e->state = XARP_ENTRY_PENDING;
         e->retry = 3;       // 最多重发 3 次
         e->ttl = 5;        // 等待 5 个 tick
-        // 构造并发送一次 ARP Request（和你现在回复用的结构类似）
+        // 构造并发送一次 ARP Request
         // target_ip = ip, target_mac 全 0, dst MAC = 广播
         // 可以写一个小函数 arp_send_request(ip) 复用上面的打包逻辑
         arp_send_request(ip); 
+        // Print ARP table after creating pending entry
+        print_arp_table();
     }
 
     return 0;   // 现在还不知道 MAC，上层需要等
@@ -294,15 +397,25 @@ void arp_table_timer(void) {
                 printf("ARP retry[%d]: %d.%d.%d.%d, left=%d\n",
                        i, e->ip[0], e->ip[1], e->ip[2], e->ip[3], e->retry);
                 arp_send_request(e->ip);
+                // Print ARP table after retry count changed
+                print_arp_table();
             } else {
                 printf("ARP timeout free[%d]: %d.%d.%d.%d\n",
                        i, e->ip[0], e->ip[1], e->ip[2], e->ip[3]);
+                
+                // Send ICMP Host Unreachable before freeing
+                send_host_unreachable(e->ip);
+
                 e->state = XARP_ENTRY_FREE;
+                // Print ARP table after freeing entry
+                print_arp_table();
             }
         } else if (e->state == XARP_ENTRY_OK && e->ttl == 0) {
             printf("ARP entry expired[%d]: %d.%d.%d.%d\n",
                    i, e->ip[0], e->ip[1], e->ip[2], e->ip[3]);
             e->state = XARP_ENTRY_FREE;
+            // Print ARP table after expiration
+            print_arp_table();
         }
     }
 }
@@ -395,7 +508,7 @@ void xip_in(xnet_packet_t *packet) {
 
     if (memcmp(ip->dest_ip, netif_ip, 4) != 0) return;
 
-    // 关键：先把对方 IP 拷出来，避免后面覆盖
+    // 先把对方 IP 拷出来，避免后面覆盖
     uint8_t src_ip[4];
     memcpy(src_ip, ip->src_ip, 4);
 
@@ -463,8 +576,6 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
         if (traceroute_active) {
             // Extract timestamp from the encapsulated packet if present
             uint32_t rtt_ticks = 0;
-            // Time Exceeded includes original IP header + 8 bytes of original data
-            // Skip to the ICMP echo request data (after 2nd IP + ICMP headers)
             if (packet->size >= sizeof(xicmp_hdr_t) + sizeof(xip_hdr_t) + sizeof(xicmp_hdr_t) + 4) {
                 uint8_t *encap_data = packet->data
                                      + sizeof(xicmp_hdr_t)
@@ -474,7 +585,7 @@ static void xicmp_in(const uint8_t src_ip[4], xnet_packet_t *packet) {
                           | ((uint32_t)encap_data[1] << 8)
                           | ((uint32_t)encap_data[2] << 16)
                           | ((uint32_t)encap_data[3] << 24);
-                uint32_t now = xnet_now_ms();             // ← 改这里
+                uint32_t now = xnet_now_ms();             // 时间戳
                 uint32_t diff = (now >= rtt_ticks) ? (now - rtt_ticks) : 0;
                 printf("  Hop from: %d.%d.%d.%d (rtt=%u ms)\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], diff);
